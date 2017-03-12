@@ -51,13 +51,29 @@ var yargs = require('yargs')
       demand: false,
       describe: 'remove figlet banner'
     })
+    .option('o', {
+      alias: 'only-aggregates',
+      default: "",
+      demand: false,
+      describe: 'queries on URLs matching this regex must specify size: 0 or be rejected (HTTP 403)',
+      type: 'string'
+    })
+    .option('e', {
+      alias: 'exclude-pattern',
+      default: "",
+      demand: false,
+      describe: 'queries on URLs NOT matching this regex must specify size: 0 or be rejected (HTTP 403)',
+      type: 'string'
+    })
     .help()
     .version()
     .strict();
+
 var argv = yargs.argv;
+var onlyAggregatesRegex = ((argv.o && new RegExp(argv.o, 'gi')) || null)
+var excludeRegex = ((argv.e && new RegExp(argv.e, 'gi')) || null)
 
 var ENDPOINT = process.env.ENDPOINT || argv._[0];
-
 if (!ENDPOINT) {
     yargs.showHelp();
     process.exit(1);
@@ -120,7 +136,57 @@ app.use(function (req, res) {
     proxy.web(req, res, {buffer: bufferStream});
 });
 
+function jsonObjectsFromString(jsonString) {
+    jsonString = jsonString.replace('\n', '', 'g');
+
+    var start = jsonString.indexOf('{');
+    var open = 0;
+    var i = start;
+    var len = jsonString.length;
+    var jsonObjectArray = [];
+
+    for (; i < len; i++) {
+        if (jsonString[i] == '{') {
+            open++;
+        } else if (jsonString[i] == '}') {
+            open--;
+            if (open === 0) {
+                jsonObjectArray.push(JSON.parse(jsonString.substring(start, i + 1)));
+                start = i + 1;
+            }
+        }
+    }
+
+    return jsonObjectArray;
+}
+
+function verifyOnlyAggregateQueries(jsonString) {
+    // Get all JSON objects from the supplied string.
+    var jsonObjectArray = jsonObjectsFromString(jsonString);
+
+    // Check each JSON object, ensuring that query objects also specify a size of 0.
+    for (var i = 0; i < jsonObjectArray.length; i++) {
+        var jsonObject = jsonObjectArray[i];
+        if (jsonObject.query != null && jsonObject.size != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 proxy.on('proxyReq', function (proxyReq, req) {
+    // Reject URLs that match match the exclude pattern, if specified.
+    if (excludeRegex && !req.url.match(excludeRegex) && !verifyOnlyAggregateQueries(req.body.toString())) {
+        req.res.status(403);
+        return proxyReq.abort();
+    }
+
+    // Enforce aggregate-only queries for matching URLs, if specified.
+    if (onlyAggregatesRegex && req.url.match(onlyAggregatesRegex) && !verifyOnlyAggregateQueries(req.body.toString())) {
+        req.res.status(403);
+        return proxyReq.abort();
+    }
+
     var endpoint = new AWS.Endpoint(ENDPOINT);
     var request = new AWS.HttpRequest(endpoint);
     request.method = proxyReq.method;
@@ -145,6 +211,10 @@ proxy.on('proxyRes', function (proxyReq, req, res) {
         res.setHeader('Cache-Control', 'public, max-age=86400');
     }
 });
+
+proxy.on('error', function(err, req, res) {
+    res.end();
+})
 
 http.createServer(app).listen(PORT, BIND_ADDRESS);
 
